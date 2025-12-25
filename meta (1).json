@@ -1,0 +1,16 @@
+{
+  "sklearn_version": "1.6.1",
+  "feature_dim": 15,
+  "lookback_min": 10,
+  "horizon_min": 10,
+  "map_hypo_thr": 65,
+  "hypo_min_sec": 60,
+  "threshold_mean_prob": 0.3465656565656566,
+  "target_sensitivity_val": 0.8,
+  "conf_min": 0.35,
+  "yellow_band": 0.1,
+  "refractory_min": 10,
+  "episode_votes": 3,
+  "episode_window": 10,
+  "adaptive_alarm_target_per_hr": 2.0
+}
