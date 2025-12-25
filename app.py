@@ -1,31 +1,68 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import joblib
+import os
 from pathlib import Path
 from datetime import datetime
 
+import numpy as np
+import pandas as pd
+import streamlit as st
+import joblib
+
+
 # =========================
-# Config
+# App Config
 # =========================
-st.set_page_config(page_title="Intraoperative Hypotension EWS", layout="wide")
+st.set_page_config(page_title="Hypotension EWS", layout="wide")
 
 FEATURES = ["MAP", "HR", "SpO2", "RR", "EtCO2"]
 LOOKBACK_MIN = 10
-HORIZON_MIN = 10
 LOOKBACK_SEC = LOOKBACK_MIN * 60
 
-DEFAULT_THRESHOLD = 0.49603405237408627  # من نتائجك
+DEFAULT_THRESHOLD = 0.49603405237408627  # من مشروعك (Validation-chosen)
 DEFAULT_REFRACTORY_MIN = 5
 
 # =========================
-# Load model artifacts
+# Robust Paths (Streamlit Cloud safe)
 # =========================
-model = joblib.load("model.pkl")
-scaler = joblib.load("scaler.pkl")
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = BASE_DIR / "model.pkl"
+SCALER_PATH = BASE_DIR / "scaler.pkl"
 
 # =========================
-# Session state
+# Load Artifacts (safe)
+# =========================
+st.title("🩺 Intraoperative Hypotension Early Warning System")
+st.caption(
+    "Procedure: Laparoscopic Cholecystectomy (GA) • Look-back: 10 min • Horizon: 10 min • "
+    "Hypotension: MAP < 65 mmHg sustained for ≥ 60 sec"
+)
+
+with st.expander("🔍 Diagnostics (for deployment)", expanded=False):
+    st.write("App folder:", str(BASE_DIR))
+    try:
+        st.write("Files in app folder:", os.listdir(BASE_DIR))
+    except Exception as e:
+        st.write("Could not list files:", e)
+    st.write("MODEL_PATH:", str(MODEL_PATH))
+    st.write("SCALER_PATH:", str(SCALER_PATH))
+
+if not MODEL_PATH.exists():
+    st.error("❌ Missing file: model.pkl (Place it in the same folder as app.py in the GitHub repo root).")
+    st.stop()
+
+if not SCALER_PATH.exists():
+    st.error("❌ Missing file: scaler.pkl (Place it in the same folder as app.py in the GitHub repo root).")
+    st.stop()
+
+@st.cache_resource
+def load_artifacts():
+    model = joblib.load(MODEL_PATH)
+    scaler = joblib.load(SCALER_PATH)
+    return model, scaler
+
+model, scaler = load_artifacts()
+
+# =========================
+# Session State
 # =========================
 if "buf" not in st.session_state:
     st.session_state.buf = pd.DataFrame(columns=["time"] + FEATURES + ["risk_prob", "alarm_raw", "alarm_final"])
@@ -33,195 +70,269 @@ if "buf" not in st.session_state:
 if "last_alarm_time" not in st.session_state:
     st.session_state.last_alarm_time = None
 
+if "t0_clock" not in st.session_state:
+    st.session_state.t0_clock = None
+
+
 # =========================
 # Helpers
 # =========================
-def compute_one_step(buf, t_now, threshold, refractory_sec):
-    """Compute risk and alarms at time t_now using last LOOKBACK window."""
+def compute_risk_from_buffer(buf: pd.DataFrame, t_now: float) -> float:
+    """Compute risk probability using mean features over last lookback window."""
     past = buf[(buf["time"] >= (t_now - LOOKBACK_SEC)) & (buf["time"] <= t_now)]
+    if len(past) < 3:
+        return 0.0
 
-    # coverage check: at least 50% of expected samples based on median dt
-    if len(past) < 5:  # minimum safeguard
-        risk_prob, alarm_raw = 0.0, 0
-    else:
-        feat = past[FEATURES].mean().values.reshape(1, -1)
-        feat_s = scaler.transform(feat)
-        risk_prob = float(model.predict_proba(feat_s)[0, 1])
-        alarm_raw = int(risk_prob >= threshold)
+    feat = past[FEATURES].mean().values.reshape(1, -1)
+    feat_s = scaler.transform(feat)
+    prob = float(model.predict_proba(feat_s)[0, 1])
+    if np.isnan(prob) or np.isinf(prob):
+        return 0.0
+    return prob
 
-    alarm_final = 0
-    if alarm_raw == 1:
-        if st.session_state.last_alarm_time is None:
-            alarm_final = 1
-            st.session_state.last_alarm_time = t_now
-        else:
-            if (t_now - st.session_state.last_alarm_time) >= refractory_sec:
-                alarm_final = 1
-                st.session_state.last_alarm_time = t_now
 
-    buf.loc[buf.index[-1], "risk_prob"] = risk_prob
-    buf.loc[buf.index[-1], "alarm_raw"] = alarm_raw
-    buf.loc[buf.index[-1], "alarm_final"] = alarm_final
-    return buf
+def apply_refractory(alarm_raw: int, t_now: float, refractory_sec: int) -> int:
+    """Return alarm_final with refractory logic."""
+    if alarm_raw != 1:
+        return 0
 
-def alarm_burden(buf):
-    """Compute alarms/hour using actual time axis."""
+    if st.session_state.last_alarm_time is None:
+        st.session_state.last_alarm_time = t_now
+        return 1
+
+    if (t_now - st.session_state.last_alarm_time) >= refractory_sec:
+        st.session_state.last_alarm_time = t_now
+        return 1
+
+    return 0
+
+
+def alarm_burden(buf: pd.DataFrame):
+    """Compute total alarms, monitoring hours, alarms/hour using actual time axis."""
     if len(buf) < 2:
         return 0, 0.0, 0.0
     total_alarms = int(buf["alarm_final"].fillna(0).sum())
-    total_time_hr = (buf["time"].iloc[-1] - buf["time"].iloc[0]) / 3600.0
-    aph = (total_alarms / total_time_hr) if total_time_hr > 0 else 0.0
-    return total_alarms, total_time_hr, aph
+    total_hours = (float(buf["time"].iloc[-1]) - float(buf["time"].iloc[0])) / 3600.0
+    aph = (total_alarms / total_hours) if total_hours > 0 else 0.0
+    return total_alarms, total_hours, aph
+
+
+def validate_csv(df: pd.DataFrame) -> (bool, str):
+    need = ["time"] + FEATURES
+    missing = [c for c in need if c not in df.columns]
+    if missing:
+        return False, f"CSV is missing columns: {missing}"
+    return True, ""
+
 
 # =========================
-# UI
+# Sidebar Controls
 # =========================
-st.title("🩺 Intraoperative Hypotension Early Warning System")
-st.caption("Target: Laparoscopic Cholecystectomy (GA) • Look-back: 10 min • Horizon: 10 min • Hypotension: MAP<65 for ≥60s")
+st.sidebar.header("Controls")
 
-left, right = st.columns([1, 2])
+mode = st.sidebar.radio("Input mode", ["Manual entry", "Upload CSV"], index=0)
 
-with left:
-    mode = st.radio("Input mode", ["Manual entry", "Upload CSV"], index=0)
+threshold = st.sidebar.number_input(
+    "Decision threshold",
+    min_value=0.0, max_value=1.0,
+    value=float(DEFAULT_THRESHOLD),
+    step=0.01
+)
 
-    threshold = st.number_input("Decision threshold", 0.0, 1.0, float(DEFAULT_THRESHOLD), 0.01)
-    refractory_min = st.number_input("Refractory (minutes)", 0, 30, int(DEFAULT_REFRACTORY_MIN), 1)
-    refractory_sec = int(refractory_min * 60)
+refractory_min = st.sidebar.number_input(
+    "Refractory (minutes)",
+    min_value=0, max_value=30,
+    value=int(DEFAULT_REFRACTORY_MIN),
+    step=1
+)
+refractory_sec = int(refractory_min * 60)
 
-    st.divider()
-    if st.button("🧹 Reset session"):
-        st.session_state.buf = pd.DataFrame(columns=["time"] + FEATURES + ["risk_prob", "alarm_raw", "alarm_final"])
-        st.session_state.last_alarm_time = None
-        st.success("Session reset.")
+st.sidebar.divider()
+
+if st.sidebar.button("🧹 Reset session"):
+    st.session_state.buf = pd.DataFrame(columns=["time"] + FEATURES + ["risk_prob", "alarm_raw", "alarm_final"])
+    st.session_state.last_alarm_time = None
+    st.session_state.t0_clock = None
+    st.sidebar.success("Session reset.")
+
 
 # =========================
-# Mode A: Manual
+# Layout
+# =========================
+left, right = st.columns([1, 2], gap="large")
+
+# =========================
+# Mode 1: Manual Entry
 # =========================
 if mode == "Manual entry":
     with left:
-        st.subheader("Manual input")
+        st.subheader("Manual data entry")
 
-        time_mode = st.selectbox("Time input", ["Auto (fixed dt)", "Manual (enter time)", "Real clock"], index=0)
+        time_mode = st.selectbox(
+            "Time input mode",
+            ["Auto (fixed dt)", "Manual (enter time)", "Real clock (elapsed)"],
+            index=0
+        )
 
-        dt_sec = st.number_input("dt seconds (for Auto mode)", min_value=1, max_value=60, value=2, step=1)
+        dt_sec = st.number_input(
+            "Auto mode dt (seconds)",
+            min_value=1, max_value=60, value=2, step=1,
+            help="Only used when Time mode = Auto (fixed dt)."
+        )
 
         with st.form("manual_form"):
-            c1, c2, c3 = st.columns(3)
+            c1, c2 = st.columns(2)
             with c1:
                 MAP = st.number_input("MAP (mmHg)", 0.0, 200.0, 75.0, 1.0)
-                HR  = st.number_input("HR (bpm)", 0.0, 250.0, 80.0, 1.0)
-            with c2:
+                HR = st.number_input("HR (bpm)", 0.0, 250.0, 80.0, 1.0)
                 SpO2 = st.number_input("SpO₂ (%)", 0.0, 100.0, 98.0, 1.0)
-                RR   = st.number_input("RR (/min)", 0.0, 60.0, 14.0, 1.0)
-            with c3:
+            with c2:
+                RR = st.number_input("RR (/min)", 0.0, 60.0, 14.0, 1.0)
                 EtCO2 = st.number_input("EtCO₂ (mmHg)", 0.0, 80.0, 35.0, 1.0)
 
             manual_time = None
             if time_mode == "Manual (enter time)":
-                manual_time_unit = st.selectbox("Manual time unit", ["seconds", "minutes"], index=1)
+                unit = st.selectbox("Manual time unit", ["minutes", "seconds"], index=0)
                 manual_time = st.number_input("Time value", min_value=0.0, value=0.0, step=0.5)
-                if manual_time_unit == "minutes":
+                if unit == "minutes":
                     manual_time = manual_time * 60.0
 
             submitted = st.form_submit_button("➕ Add reading")
 
-    if submitted:
-        buf = st.session_state.buf.copy()
+        if submitted:
+            buf = st.session_state.buf.copy()
 
-        # Determine time
-        if time_mode == "Auto (fixed dt)":
-            if len(buf) == 0:
-                t = 0.0
-            else:
-                t = float(buf["time"].iloc[-1]) + float(dt_sec)
+            # Determine time
+            if time_mode == "Auto (fixed dt)":
+                if len(buf) == 0:
+                    t = 0.0
+                else:
+                    t = float(buf["time"].iloc[-1]) + float(dt_sec)
 
-        elif time_mode == "Manual (enter time)":
-            t = float(manual_time)
+            elif time_mode == "Manual (enter time)":
+                t = float(manual_time)
 
-        else:  # Real clock
-            # store as elapsed seconds since first entry
-            now = datetime.now().timestamp()
-            if len(buf) == 0 or "t0_clock" not in st.session_state:
-                st.session_state.t0_clock = now
-                t = 0.0
-            else:
-                t = now - st.session_state.t0_clock
+            else:  # Real clock (elapsed)
+                now = datetime.now().timestamp()
+                if st.session_state.t0_clock is None:
+                    st.session_state.t0_clock = now
+                    t = 0.0
+                else:
+                    t = float(now - st.session_state.t0_clock)
 
-        # Append
-        new_row = {"time": t, "MAP": MAP, "HR": HR, "SpO2": SpO2, "RR": RR, "EtCO2": EtCO2}
-        buf = pd.concat([buf, pd.DataFrame([new_row])], ignore_index=True)
+            # Append new row
+            new_row = {
+                "time": t,
+                "MAP": float(MAP),
+                "HR": float(HR),
+                "SpO2": float(SpO2),
+                "RR": float(RR),
+                "EtCO2": float(EtCO2),
+                "risk_prob": np.nan,
+                "alarm_raw": 0,
+                "alarm_final": 0
+            }
+            buf = pd.concat([buf, pd.DataFrame([new_row])], ignore_index=True)
 
-        # Keep last 30 minutes for display (optional)
-        keep_sec = 30 * 60
-        buf = buf[buf["time"] >= (t - keep_sec)].reset_index(drop=True)
+            # Keep last 30 min for display
+            keep_sec = 30 * 60
+            buf = buf[buf["time"] >= (t - keep_sec)].reset_index(drop=True)
 
-        # Compute risk and alarms
-        buf = compute_one_step(buf, t, threshold, refractory_sec)
+            # Compute risk + alarms for last row
+            prob = compute_risk_from_buffer(buf, t)
+            alarm_raw = int(prob >= threshold)
+            alarm_final = apply_refractory(alarm_raw, t, refractory_sec)
 
-        st.session_state.buf = buf
+            buf.loc[buf.index[-1], "risk_prob"] = prob
+            buf.loc[buf.index[-1], "alarm_raw"] = alarm_raw
+            buf.loc[buf.index[-1], "alarm_final"] = alarm_final
+
+            st.session_state.buf = buf
+            st.success("Reading added.")
 
 # =========================
-# Mode B: CSV upload
+# Mode 2: CSV Upload
 # =========================
 else:
     with left:
         st.subheader("Upload CSV")
-        st.write("CSV must contain columns: time, MAP, HR, SpO2, RR, EtCO2")
-        up = st.file_uploader("Choose a CSV file", type=["csv"])
+        st.write("CSV must contain columns: `time, MAP, HR, SpO2, RR, EtCO2`")
+        st.caption("Time can be in seconds (recommended). Minutes also works if consistent; alarms/hour use the provided time axis.")
+        up = st.file_uploader("Choose CSV file", type=["csv"])
 
     if up is not None:
-        df = pd.read_csv(up).sort_values("time").reset_index(drop=True)
+        df = pd.read_csv(up)
+        ok, msg = validate_csv(df)
+        if not ok:
+            st.error(msg)
+            st.stop()
 
-        # predict sequentially to respect refractory timing
+        df = df.sort_values("time").reset_index(drop=True)
+
+        # Reset refractory state for CSV replay
+        st.session_state.last_alarm_time = None
+        st.session_state.t0_clock = None
+
+        # Create buffer with predictions sequentially (to respect refractory timing)
         buf = df[["time"] + FEATURES].copy()
         buf["risk_prob"] = np.nan
         buf["alarm_raw"] = 0
         buf["alarm_final"] = 0
 
-        st.session_state.last_alarm_time = None
-
         for i in range(len(buf)):
             t = float(buf.loc[i, "time"])
-            # compute using history within this uploaded dataframe
-            hist = buf.iloc[:i+1].copy()
-            # place hist into temp buffer and compute last row prediction
-            hist = compute_one_step(hist, t, threshold, refractory_sec)
-            buf.loc[i, ["risk_prob", "alarm_raw", "alarm_final"]] = hist.iloc[-1][["risk_prob", "alarm_raw", "alarm_final"]].values
+            hist = buf.iloc[: i + 1].copy()
+            prob = compute_risk_from_buffer(hist, t)
+            alarm_raw = int(prob >= threshold)
+            alarm_final = apply_refractory(alarm_raw, t, refractory_sec)
+
+            buf.loc[i, "risk_prob"] = prob
+            buf.loc[i, "alarm_raw"] = alarm_raw
+            buf.loc[i, "alarm_final"] = alarm_final
 
         st.session_state.buf = buf
+        st.success("CSV processed successfully.")
+
 
 # =========================
-# Display results
+# Outputs
 # =========================
 buf = st.session_state.buf
 
 with right:
-    st.subheader("Status & Outputs")
+    st.subheader("Outputs")
 
     if len(buf) == 0:
-        st.info("No data yet. Use Manual entry or upload a CSV.")
+        st.info("No data yet. Use Manual entry or Upload CSV.")
     else:
         last = buf.iloc[-1]
-        c1, c2, c3 = st.columns(3)
+
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("Risk probability", f"{float(last['risk_prob']):.3f}" if pd.notna(last["risk_prob"]) else "—")
         c2.metric("Alarm (raw)", "YES" if int(last["alarm_raw"]) == 1 else "NO")
         c3.metric("Alarm (final)", "YES" if int(last["alarm_final"]) == 1 else "NO")
 
-        total_alarms, total_hr, aph = alarm_burden(buf)
-        st.write(f"**Total alarms (final):** {total_alarms}")
-        st.write(f"**Monitoring time:** {total_hr:.2f} hours")
-        st.write(f"**Alarms per hour:** {aph:.2f}")
+        total_alarms, total_hours, aph = alarm_burden(buf)
+        c4.metric("Alarms/hour", f"{aph:.2f}")
+
+        st.markdown(
+            f"**Total alarms (final):** {total_alarms}  \n"
+            f"**Monitoring time:** {total_hours:.2f} hours"
+        )
 
         st.divider()
-        st.subheader("Trends")
+        st.subheader("Trend (MAP)")
         st.line_chart(buf.set_index("time")[["MAP"]])
 
-        st.subheader("Recent records")
-        st.dataframe(buf.tail(30))
+        st.subheader("Recent rows")
+        st.dataframe(buf.tail(30), use_container_width=True)
 
         st.download_button(
-            "⬇️ Download log CSV",
+            "⬇️ Download session log CSV",
             data=buf.to_csv(index=False).encode("utf-8"),
-            file_name="hypotension_app_log.csv",
-            mime="text/csv"
+            file_name="hypotension_ews_session_log.csv",
+            mime="text/csv",
         )
+
+st.markdown("---")
+st.caption("Research prototype — for educational and validation use only (not for clinical decision-making).")
